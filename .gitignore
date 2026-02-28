@@ -1,0 +1,13 @@
+# 1. Python 自動產生的暫存檔
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 2. 環境與機密檔案 (未來如果你有串接 API 金鑰會用到)
+.env
+venv/
+.venv/
+
+# 3. 我們的量化框架專屬設定 (絕對不能上傳的巨大檔案)
+data/
+outputs/
