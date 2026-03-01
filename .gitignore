@@ -11,3 +11,6 @@ venv/
 # 3. 我們的量化框架專屬設定 (絕對不能上傳的巨大檔案)
 data/
 outputs/
+
+# VS Code settings
+.vscode/
