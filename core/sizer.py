@@ -26,44 +26,23 @@ class FixedRiskSizer:
         return min(shares_by_risk, max_capital_shares)
     
     
-class FixedWeightSizer:
-    """
-    固定權重 Sizer (Equal Weight)
-    不依賴停損價，單純依照資金比例分配倉位。
-    """
-    def __init__(self, pos_pct=0.10):
-        self.pos_pct = pos_pct      # 預設每檔買 10%
-
-    def calculate_shares(self, equity, entry_price, stop_price=None):
-        # 防呆
-        if entry_price <= 0: return 0
-        
-        # 1. 計算目標投入金額
-        target_capital = equity * self.pos_pct
-        
-        # 2. 換算股數
-        shares = int(target_capital / entry_price)
-        
-        return shares
-    
-import math
-
 class EqualWeightSizer:
     """
-    等權重部位管理器
-    邏輯：資金總額 / 最大持倉數 = 每檔股票可分配金額
+    等權重部位管理器 (融合版)
+    邏輯：(資金總額 * 緩衝比例) / 最大持倉數 = 每檔股票可分配金額
     """
     def __init__(self, max_positions=10, buffer=0.95):
         self.max_positions = max_positions
-        self.buffer = buffer # 保留 5% 現金緩衝，避免因價格波動導致下單失敗
+        self.buffer = buffer
 
-    def calculate_shares(self, portfolio_value, entry_price, stop_price=0):
-        if entry_price == 0: return 0
+    def calculate_shares(self, equity, entry_price, stop_price=None): # stop_price 留著當備用參數，保持介面統一
+        if entry_price <= 0: 
+            return 0
         
-        # 計算每檔股票的目標金額 (例如 10萬 / 10 = 1萬)
-        target_capital = (portfolio_value * self.buffer) / self.max_positions
+        # 計算每檔標的的目標投入金額
+        target_capital = (equity * self.buffer) / self.max_positions
         
-        # 計算股數 (無條件捨去)
+        # 換算股數 (無條件捨去成整數)
         shares = int(target_capital / entry_price)
         return shares
 

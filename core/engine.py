@@ -8,29 +8,27 @@ from collections import defaultdict
 # ==========================================
 
 class AdvancedEventEngine:
-    def __init__(self, data_feed=None, 
-                 initial_cash=100000, 
-                 impact_cost=0.0, 
-                 comm_rate=0.0):
-        
+    # 我們把 config 字典傳進來
+    def __init__(self, config: dict, data_feed=None): 
         if data_feed is not None:
             self.df_data = data_feed
         else:
             self.df_data = None
             
-        self.initial_cash = initial_cash
-        self.cash = initial_cash
-        self.portfolio_value = initial_cash
+        # 從你專屬的 config 食譜中讀取系統設定
+        self.initial_cash = config.get('initial_capital', 100000)
+        self.cash = self.initial_cash
+        self.portfolio_value = self.initial_cash
         
-        self.impact_cost = impact_cost
-        self.comm_rate = comm_rate
+        self.impact_cost = config.get('slippage_percent', 0.002)
+        self.comm_rate = config.get('commission_rate', 0.001)
         
         self.positions = {}
         self.pending_entries = []
         self.daily_log = []
         self.trade_log = []
         
-        # 🌟 [新增] 準備一個空列表來接每期的橫截面排名快照
+        # 準備一個空列表來接每期的橫截面排名快照
         self.rank_log = [] 
         
         self.exit_policies = []
@@ -121,21 +119,48 @@ class AdvancedEventEngine:
             
         return self
 
-    def _execute_sell(self, date, ticker, raw_price, reason):
-        pos = self.positions.pop(ticker)
-        shares = pos['shares']
+    # 🌟 [升級] 加入 shares_to_sell 參數，支援部分平倉
+    def _execute_sell(self, date, ticker, raw_price, reason, shares_to_sell=None):
+        if ticker not in self.positions: 
+            return
+            
+        pos = self.positions[ticker]
+        current_shares = pos['shares']
         
+        # 判斷是「全部平倉」還是「部分平倉」
+        if shares_to_sell is None or shares_to_sell >= current_shares:
+            shares_to_sell = current_shares
+            is_partial = False
+            # 全部賣出，把該檔股票從帳戶字典中剔除
+            self.positions.pop(ticker)
+        else:
+            is_partial = True
+            # 部分賣出，扣除指定股數
+            pos['shares'] -= shares_to_sell
+            
+        # 計算實際成交價與手續費
         exec_price = raw_price * (1 - self.impact_cost)
-        
-        proceeds = shares * exec_price
+        proceeds = shares_to_sell * exec_price
         comm = proceeds * self.comm_rate
         net_proceeds = proceeds - comm
         
+        # 錢回到帳戶
         self.cash += net_proceeds
         
-        cost = pos['cost'] 
-        profit = net_proceeds - cost
-        profit_pct = (net_proceeds / cost) - 1
+        # 🌟 核心會計邏輯：按比例計算被賣掉的那部分成本 (平均成本法)
+        avg_cost_per_share = pos['cost'] / current_shares
+        cost_of_sold = avg_cost_per_share * shares_to_sell
+        
+        # 如果是部分平倉，要把剩餘的部位成本扣掉
+        if is_partial:
+            pos['cost'] -= cost_of_sold
+            
+        # 計算這筆交易的獲利
+        profit = net_proceeds - cost_of_sold
+        profit_pct = (net_proceeds / cost_of_sold) - 1 if cost_of_sold > 0 else 0
+        
+        # 紀錄交易日誌 (標註是否為部分平倉)
+        log_reason = reason + (" (Partial)" if is_partial else "")
         
         self.trade_log.append({
             'ticker': ticker,
@@ -143,12 +168,12 @@ class AdvancedEventEngine:
             'exit_date': date,
             'entry_price': pos['entry_price'], 
             'exit_price': exec_price,          
-            'shares': shares,
+            'shares': shares_to_sell,  # 紀錄賣出的股數
             'profit': profit,
             'profit_pct': profit_pct,
-            'reason': reason,
+            'reason': log_reason,
             'bars_held': pos['bars_held'],
-            'entry_value': cost,
+            'entry_value': cost_of_sold,
             'net_proceeds': net_proceeds
         })
 
@@ -182,12 +207,21 @@ class AdvancedEventEngine:
             for ticker in list(self.positions.keys()):
                 pos = self.positions[ticker]
                 if pos.get('exit_pending', False):
+                    # 跌停板賣不掉的防呆
                     if has_limit_status and todays_data['limit_status'].get(ticker) == '-':
                         continue 
                         
                     raw_open = todays_data['raw_open'].get(ticker)
                     if not pd.isna(raw_open):
-                        self._execute_sell(today, ticker, raw_open, pos['exit_reason'])
+                        # 🌟 新增：讀取要賣出的股數 (停損預設為 None 全部賣出，再平衡會有指定股數)
+                        shares_to_sell = pos.get('exit_shares', None)
+                        self._execute_sell(today, ticker, raw_open, pos['exit_reason'], shares_to_sell=shares_to_sell)
+                        
+                        # 🌟 新增：如果是「部分平倉(減碼)」，股票還在帳戶裡，要把它的賣出狀態重置
+                        if ticker in self.positions:
+                            self.positions[ticker]['exit_pending'] = False
+                            self.positions[ticker]['exit_reason'] = None
+                            self.positions[ticker]['exit_shares'] = None
 
             # --- [Step 1-B] 執行買單 ---
             for entry_order in self.pending_entries:
@@ -231,7 +265,11 @@ class AdvancedEventEngine:
                     else:
                         stop_price_raw = 0
 
-                    shares = self.sizer.calculate_shares(self.portfolio_value, exec_raw_price, stop_price_raw)
+                    # 🌟 新增：如果是再平衡訂單，直接使用算好的目標股數；否則呼叫 Sizer
+                    if 'target_shares' in entry_order:
+                        shares = entry_order['target_shares']
+                    else:
+                        shares = self.sizer.calculate_shares(self.portfolio_value, exec_raw_price, stop_price_raw)
                     
                     if shares > 0:
                         final_cost_price = exec_raw_price * (1 + self.impact_cost)
