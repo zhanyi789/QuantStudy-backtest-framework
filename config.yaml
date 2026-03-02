@@ -1,0 +1,87 @@
+# ==========================================
+# 1. 系統與交易成本 (System & Costs)
+# ==========================================
+system:
+  initial_capital: 1000000        
+  risk_free_rate: 0.02            
+  commission_rate: 0.001425       # 交易手續費
+  slippage_pct: 0.002             # 滑點設定
+
+# ==========================================
+# 2. 策略大腦庫 (Strategies) 
+# ⚠️ 請只將「其中一個」設為 enabled: true
+# ==========================================
+strategies:
+  CRSIStrategy:                   # 擇時流派：CRSI 均值回歸
+    enabled: true
+    crsi_entry: 10                  
+    crsi_exit: 70                   
+    limit_pct: 0.02
+    
+  MomentumRotationStrategy:       # 換倉流派：動能輪動策略
+    enabled: false
+    rebalance_day: 15             # 🌟 每月 15 號換倉 (遇假日自動順延至次一交易日)
+    rank_metric: "momentum_12m"   
+    ascending: false              
+
+# ==========================================
+# 3. 資金管理員 (Sizers)
+# ⚠️ 請只將「其中一個」設為 enabled: true
+# ==========================================
+sizers:
+  FixedRiskSizer:                 # 固定風險資金管理 (適合擇時策略)
+    enabled: true
+    risk_pct: 0.01
+    
+  EqualWeightSizer:               # 等權重資金管理 (適合輪動策略)
+    enabled: false
+    max_positions: 10
+
+# ==========================================
+# 4. 🛡️ 保險絲模組 (Exits) - ⚠️ 清單順序代表優先級！
+# 系統會由上往下檢查，排在越上面的保險絲擁有越高的砍單優先權
+# 將 enabled 設為 true 即可掛載該保險絲
+# ==========================================
+exits:
+  - name: FixedPercentStop        # [優先級 1] 硬停損絕對最優先
+    enabled: false
+    pct: 0.05
+    
+  - name: ATRTrailingStop         # [優先級 2] ATR 吊燈移動停利/停損
+    enabled: false
+    multiplier: 2.5
+    window: 14
+
+  - name: NBarExit                # [優先級 3] 最大持倉時間限制 (時間到了就得走)
+    enabled: true
+    n: 10
+    
+  - name: IndicatorExit           # [優先級 4] 技術指標出場 (由保險絲監控指標變化)
+    enabled: false
+    indicator: 'crsi'
+    threshold: 70
+    logic: '>'
+
+# ==========================================
+# 5. 🌐 老爸的全局大盤濾網 (Global Filters)
+# 數值大於 0 代表啟用，0 代表關閉
+# ==========================================
+global_filters:
+  vix_max: 0                     
+  vix_min: 0                      
+  market_ma_window: 0           
+  avoid_friday: false              
+
+# ==========================================
+# 6. 🔬 8 大消融測試濾網 (Ablation Filters)
+# 數值大於 0 代表啟用，0 代表關閉
+# ==========================================
+ablation_filters:
+  ma_window: 0                    
+  spy_ma_window: 0                
+  min_turnover: 0                 
+  hv_threshold: 0                 
+  adx_threshold: 0                
+  ibs_threshold: 0                
+  gap_threshold: 0                
+  rsi_strength_threshold: 0
