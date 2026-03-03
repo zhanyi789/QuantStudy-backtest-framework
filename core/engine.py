@@ -10,6 +10,7 @@ from collections import defaultdict
 class AdvancedEventEngine:
     # 我們把 config 字典傳進來
     def __init__(self, config: dict, data_feed=None): 
+        self.config = config
         if data_feed is not None:
             self.df_data = data_feed
         else:
@@ -174,6 +175,8 @@ class AdvancedEventEngine:
             'reason': log_reason,
             'bars_held': pos['bars_held'],
             'entry_value': cost_of_sold,
+            'highest_price': pos['highest_price'], # 🌟 新增：匯出給績效模組算 MFE
+            'lowest_price': pos['lowest_price'],   # 🌟 新增：匯出給績效模組算 MAE
             'net_proceeds': net_proceeds
         })
 
@@ -225,7 +228,9 @@ class AdvancedEventEngine:
 
             # --- [Step 1-B] 執行買單 ---
             for entry_order in self.pending_entries:
-                if max_positions and len(self.positions) >= max_positions: break 
+                max_pos = self.config.get('max_positions', 0)
+                if max_pos > 0 and len(self.positions) >= max_pos: break 
+                
                 ticker = entry_order['ticker']
                 if ticker in self.positions: continue
                 
@@ -284,6 +289,7 @@ class AdvancedEventEngine:
                                 'entry_date': today, 
                                 'bars_held': 0, 
                                 'highest_price': exec_raw_price, 
+                                'lowest_price': exec_raw_price,
                                 'indicators': entry_order['indicators'],
                                 'exit_pending': False, 
                                 'exit_reason': None,
@@ -333,6 +339,7 @@ class AdvancedEventEngine:
                 if triggered_stop: continue 
 
                 pos['highest_price'] = max(pos['highest_price'], raw_high)
+                pos['lowest_price'] = min(pos['lowest_price'], raw_low)
 
                 for col in indicator_cols:
                     val = todays_data[col].get(ticker)
@@ -382,28 +389,92 @@ class AdvancedEventEngine:
                 signal_series = todays_data['signal']
                 candidates = signal_series[signal_series == 1].index.tolist()
                 
-                if 'rank' in todays_data and candidates:
-                    candidate_ranks = todays_data['rank'].loc[candidates]
-                    sorted_candidates = candidate_ranks.sort_values().index.tolist()
-                else:
-                    sorted_candidates = sorted(candidates)
+                if candidates:
+                    # 1. 讀取 Config 中的排序設定 (預設使用 crsi)
+                    rank_col = self.config.get('rank_metric', 'crsi')
+                    asc = self.config.get('ascending', True)
+                    
+                    # 2. 執行排序
+                    if rank_col in todays_data:
+                        candidate_ranks = todays_data[rank_col].loc[candidates]
+                        sorted_candidates = candidate_ranks.sort_values(ascending=asc).index.tolist()
+                    else:
+                        sorted_candidates = sorted(candidates)
+                        
+                    # 3. 計算剩餘空缺並截斷清單
+                    max_pos = self.config.get('max_positions', 0)
+                    if max_pos > 0:
+                        current_pos = len(self.positions)
+                        available_slots = max_pos - current_pos
+                        if available_slots <= 0:
+                            sorted_candidates = [] # 持倉已滿，不產生新買單
+                        else:
+                            sorted_candidates = sorted_candidates[:available_slots]
                 
-                for ticker in sorted_candidates:
-                    if ticker in self.positions: continue
-                    
-                    indicators_snapshot = {}
-                    for col in indicator_cols:
-                        val = todays_data[col].get(ticker)
-                        if not pd.isna(val): indicators_snapshot[col] = val
-                    
-                    limit_p = todays_data['limit_price'].get(ticker) if 'limit_price' in todays_data else None
+                    # 4. 將過濾後的標的加入待買清單
+                    for ticker in sorted_candidates:
+                        if ticker in self.positions: continue
+                        
+                        indicators_snapshot = {}
+                        for col in indicator_cols:
+                            val = todays_data[col].get(ticker)
+                            if not pd.isna(val): indicators_snapshot[col] = val
+                        
+                        limit_p = todays_data['limit_price'].get(ticker) if 'limit_price' in todays_data else None
 
-                    self.pending_entries.append({
-                        'ticker': ticker, 
-                        'signal_date': today, 
-                        'indicators': indicators_snapshot,
-                        'limit_price': limit_p 
-                    })
+                        self.pending_entries.append({
+                            'ticker': ticker, 
+                            'signal_date': today, 
+                            'indicators': indicators_snapshot,
+                            'limit_price': limit_p 
+                        })
+
+            # ==========================================
+            # 🌟 [新增 Step 3-B] 目標權重再平衡 (Target Weight Rebalancing)
+            # ==========================================
+            if 'target_weight' in todays_data:
+                weights = todays_data['target_weight'].dropna()
+                if not weights.empty:
+                    # 找出所有「目標要買的」跟「目前持有的」標的聯集
+                    target_tickers = set(weights.index)
+                    current_tickers = set(self.positions.keys())
+                    all_rebalance_tickers = target_tickers.union(current_tickers)
+                    
+                    for ticker in all_rebalance_tickers:
+                        # 如果股票不在目標權重清單中，代表新權重為 0 (必須清倉)
+                        target_w = weights.get(ticker, 0.0) 
+                        
+                        raw_close = todays_data['raw_close'].get(ticker)
+                        if pd.isna(raw_close) or raw_close == 0: continue
+                        
+                        # 1. 精算目標股數
+                        target_capital = self.portfolio_value * target_w
+                        target_shares = int(target_capital / raw_close)
+                        
+                        # 2. 獲取目前股數
+                        current_shares = self.positions[ticker]['shares'] if ticker in self.positions else 0
+                        
+                        # 3. 計算差額
+                        diff_shares = target_shares - current_shares
+                        
+                        # 4. 發送對應的 T+1 訂單
+                        if diff_shares > 0: 
+                            # 加碼或新建倉：丟入待買清單
+                            self.pending_entries.append({
+                                'ticker': ticker, 
+                                'signal_date': today, 
+                                'indicators': {}, # 可根據策略補上
+                                'limit_price': None,
+                                'target_shares': diff_shares, # 🌟 指定加碼股數
+                                'reason': 'Rebalance Buy'
+                            })
+                        elif diff_shares < 0: 
+                            # 減碼或清倉：標記為待賣出
+                            shares_to_sell = abs(diff_shares)
+                            if ticker in self.positions:
+                                self.positions[ticker]['exit_pending'] = True
+                                self.positions[ticker]['exit_reason'] = 'Rebalance Sell'
+                                self.positions[ticker]['exit_shares'] = shares_to_sell # 🌟 指定減碼股數
 
             # --- [Step 4] 結算 ---
             equity = self.cash
