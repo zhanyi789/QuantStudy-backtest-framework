@@ -20,15 +20,22 @@ class AdvancedEventEngine:
         self.initial_cash = config.get('initial_capital', 100000)
         self.cash = self.initial_cash
         self.portfolio_value = self.initial_cash
-        
-        self.impact_cost = config.get('slippage_percent', 0.002)
+
+        # P0-2: slippage key 統一支援兩種寫法
+        self.impact_cost = config.get('slippage_pct', config.get('slippage_percent', 0.002))
         self.comm_rate = config.get('commission_rate', 0.001)
-        
+
+        # P0-1: 讀取 engine: 區段的引擎參數，支援 flat dict fallback
+        engine_cfg = config.get('engine', {})
+        self.max_positions = engine_cfg.get('max_positions', config.get('max_positions', 0))
+        self.rank_metric = engine_cfg.get('rank_metric', config.get('rank_metric', 'crsi'))
+        self.ascending = engine_cfg.get('ascending', config.get('ascending', True))
+
         self.positions = {}
         self.pending_entries = []
         self.daily_log = []
         self.trade_log = []
-        
+
         # 準備一個空列表來接每期的橫截面排名快照
         self.rank_log = [] 
         
@@ -180,7 +187,7 @@ class AdvancedEventEngine:
             'net_proceeds': net_proceeds
         })
 
-    def run(self, strategy_instance, max_positions=None):
+    def run(self, strategy_instance):  # P2-2: 移除孤兒參數 max_positions（已由 self.max_positions 管理）
         print(f"🕹️ Engine Started. (Slippage: {self.impact_cost:.2%})")
         
         df_full = strategy_instance.generate_signals(self.df_data)
@@ -228,7 +235,7 @@ class AdvancedEventEngine:
 
             # --- [Step 1-B] 執行買單 ---
             for entry_order in self.pending_entries:
-                max_pos = self.config.get('max_positions', 0)
+                max_pos = self.max_positions  # P0-1: 使用實例屬性，確保持倉上限生效
                 if max_pos > 0 and len(self.positions) >= max_pos: break 
                 
                 ticker = entry_order['ticker']
@@ -244,11 +251,12 @@ class AdvancedEventEngine:
                 
                 if pd.isna(raw_open) or pd.isna(raw_low): continue
                 if pd.isna(adj_close) or adj_close == 0: continue
-                price_ratio = raw_close / adj_close 
+                # 限價換算：優先使用 T 日（信號日）儲存的 price_ratio，避免用 T+1 收盤前視偏誤
+                price_ratio = entry_order.get('signal_price_ratio') or (raw_close / adj_close)
 
                 target_adj_price = entry_order.get('limit_price')
                 exec_raw_price = None
-                
+
                 if target_adj_price is None or pd.isna(target_adj_price):
                     exec_raw_price = raw_open
                 else:
@@ -324,22 +332,24 @@ class AdvancedEventEngine:
                 if 'atr' in check_bar:
                     check_bar['atr'] = check_bar['atr'] * current_ratio
 
+                # 先更新當日最高/最低價，再進行停損檢查
+                # 確保即使盤中停損觸發，MFE/MAE 統計也能包含觸發當日的極值
+                pos['highest_price'] = max(pos['highest_price'], raw_high)
+                pos['lowest_price'] = min(pos['lowest_price'], raw_low)
+
                 triggered_stop = False
                 for exit_mod in self.exit_policies:
-                    mod_name = exit_mod.__class__.__name__
-                    is_intraday = "Stop" in mod_name or "Trailing" in mod_name
-                    
+                    # P1-2: 使用 is_intraday 屬性替代字串判斷，更可靠
+                    is_intraday = getattr(exit_mod, 'is_intraday', False)
+
                     if is_intraday:
                         is_hit, price, reason = exit_mod.check(check_bar, pos)
                         if is_hit:
                             self._execute_sell(today, ticker, price, reason)
                             triggered_stop = True
-                            break 
-                
-                if triggered_stop: continue 
+                            break
 
-                pos['highest_price'] = max(pos['highest_price'], raw_high)
-                pos['lowest_price'] = min(pos['lowest_price'], raw_low)
+                if triggered_stop: continue
 
                 for col in indicator_cols:
                     val = todays_data[col].get(ticker)
@@ -347,15 +357,17 @@ class AdvancedEventEngine:
 
                 eod_bar = check_bar.copy() 
                 
+                # P1-3: 出場優先規則：盤中停損 > EOD 出場，EOD 中先觸發者優先
                 for exit_mod in self.exit_policies:
-                    mod_name = exit_mod.__class__.__name__
-                    is_eod = not ("Stop" in mod_name or "Trailing" in mod_name)
+                    # P1-2: 使用 is_intraday 屬性替代字串判斷
+                    is_eod = not getattr(exit_mod, 'is_intraday', False)
                     if is_eod:
                         is_hit, _, reason = exit_mod.check(eod_bar, pos)
                         if is_hit:
-                            pos['exit_pending'] = True
-                            pos['exit_reason'] = reason
-                            break
+                            if not pos.get('exit_pending', False):
+                                pos['exit_pending'] = True
+                                pos['exit_reason'] = reason
+                            break  # EOD 中只執行第一個觸發的模組
                             
             # ==========================================
             # 🌟 [新增] 擷取橫截面排名快照 (Cross-Sectional Snapshot)
@@ -384,15 +396,26 @@ class AdvancedEventEngine:
                             
                     self.rank_log.append(snap_df)
             
+            # --- [Step 3-A] 處理策略主動出場訊號 (signal == -1) ---
+            # P1-1: 讀取 signal=-1，若在持倉中則標記為待出場
+            if 'signal' in todays_data:
+                signal_series = todays_data['signal']
+                exit_signals = signal_series[signal_series == -1].index.tolist()
+                for ticker in exit_signals:
+                    if ticker in self.positions:
+                        if not self.positions[ticker].get('exit_pending', False):
+                            self.positions[ticker]['exit_pending'] = True
+                            self.positions[ticker]['exit_reason'] = 'Strategy_Signal_Exit'
+
             # --- [Step 3] 產生買單 ---
             if 'signal' in todays_data:
                 signal_series = todays_data['signal']
                 candidates = signal_series[signal_series == 1].index.tolist()
                 
                 if candidates:
-                    # 1. 讀取 Config 中的排序設定 (預設使用 crsi)
-                    rank_col = self.config.get('rank_metric', 'crsi')
-                    asc = self.config.get('ascending', True)
+                    # 1. 讀取排序設定 (P0-1: 使用實例屬性，確保排序參數生效)
+                    rank_col = self.rank_metric
+                    asc = self.ascending
                     
                     # 2. 執行排序
                     if rank_col in todays_data:
@@ -401,8 +424,8 @@ class AdvancedEventEngine:
                     else:
                         sorted_candidates = sorted(candidates)
                         
-                    # 3. 計算剩餘空缺並截斷清單
-                    max_pos = self.config.get('max_positions', 0)
+                    # 3. 計算剩餘空缺並截斷清單 (P0-1: 使用實例屬性)
+                    max_pos = self.max_positions
                     if max_pos > 0:
                         current_pos = len(self.positions)
                         available_slots = max_pos - current_pos
@@ -414,19 +437,26 @@ class AdvancedEventEngine:
                     # 4. 將過濾後的標的加入待買清單
                     for ticker in sorted_candidates:
                         if ticker in self.positions: continue
-                        
+
                         indicators_snapshot = {}
                         for col in indicator_cols:
                             val = todays_data[col].get(ticker)
                             if not pd.isna(val): indicators_snapshot[col] = val
-                        
+
                         limit_p = todays_data['limit_price'].get(ticker) if 'limit_price' in todays_data else None
 
+                        # 在 T 日產生買單時，就把當天的 price_ratio 存起來
+                        # 避免 Step 1-B 執行時用到 T+1 的收盤 price_ratio（前視偏誤）
+                        _adj_c = todays_data['close'].get(ticker)
+                        _raw_c = todays_data['raw_close'].get(ticker)
+                        _signal_price_ratio = (_raw_c / _adj_c) if (_adj_c and not pd.isna(_adj_c) and _adj_c != 0) else None
+
                         self.pending_entries.append({
-                            'ticker': ticker, 
-                            'signal_date': today, 
+                            'ticker': ticker,
+                            'signal_date': today,
                             'indicators': indicators_snapshot,
-                            'limit_price': limit_p 
+                            'limit_price': limit_p,
+                            'signal_price_ratio': _signal_price_ratio  # T 日的調整因子比例
                         })
 
             # ==========================================
@@ -435,20 +465,28 @@ class AdvancedEventEngine:
             if 'target_weight' in todays_data:
                 weights = todays_data['target_weight'].dropna()
                 if not weights.empty:
+                    # 再平衡前先計算當日最新 equity（用當日收盤估值）
+                    # 避免使用前一天的 portfolio_value 導致目標股數計算偏差
+                    current_equity = self.cash
+                    for _t, _p in self.positions.items():
+                        _price = todays_data['raw_close'].get(_t, _p['entry_price'])
+                        if not pd.isna(_price):
+                            current_equity += _p['shares'] * _price
+
                     # 找出所有「目標要買的」跟「目前持有的」標的聯集
                     target_tickers = set(weights.index)
                     current_tickers = set(self.positions.keys())
                     all_rebalance_tickers = target_tickers.union(current_tickers)
-                    
+
                     for ticker in all_rebalance_tickers:
                         # 如果股票不在目標權重清單中，代表新權重為 0 (必須清倉)
-                        target_w = weights.get(ticker, 0.0) 
-                        
+                        target_w = weights.get(ticker, 0.0)
+
                         raw_close = todays_data['raw_close'].get(ticker)
                         if pd.isna(raw_close) or raw_close == 0: continue
-                        
-                        # 1. 精算目標股數
-                        target_capital = self.portfolio_value * target_w
+
+                        # 1. 精算目標股數（使用當日即時 equity，而非前日值）
+                        target_capital = current_equity * target_w
                         target_shares = int(target_capital / raw_close)
                         
                         # 2. 獲取目前股數

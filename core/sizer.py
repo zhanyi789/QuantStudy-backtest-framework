@@ -5,23 +5,32 @@ import matplotlib.pyplot as plt
 
 
 class FixedRiskSizer:
-    # 加入 max_pos_pct 參數，預設 1.0 (100% 現金)，保守可設 0.95
-    def __init__(self, risk_pct=0.01, max_pos_pct=1.0):
+    # max_pos_pct: 單筆最大資金佔比，預設 0.1 (10%)，避免無停損時全押一檔
+    def __init__(self, risk_pct=0.01, max_pos_pct=0.1):
         self.risk_pct = risk_pct
         self.max_pos_pct = max_pos_pct
 
     def calculate_shares(self, equity, entry_price, stop_price):
-        if stop_price >= entry_price: return 0
-        
-        # 1. 計算基於風險的理想股數 (您的邏輯)
+        if entry_price <= 0:
+            return 0
+
+        # P0-3: 無停損 fallback（stop_price <= 0 代表沒有設定停損價）
+        # 改用 max_pos_pct 直接計算等額倉位，確保資金充分利用
+        if stop_price <= 0:
+            target_capital = equity * self.max_pos_pct
+            return int(target_capital / entry_price)
+
+        if stop_price >= entry_price:
+            return 0
+
+        # 1. 計算基於風險的理想股數
         risk_per_share = entry_price - stop_price
         total_risk_allowed = equity * self.risk_pct
         shares_by_risk = int(total_risk_allowed / risk_per_share)
-        
-        # 2. 計算基於現金的上限股數 (防爆衝補丁)
-        # 看看口袋裡的錢夠買幾股
+
+        # 2. 計算基於現金的上限股數
         max_capital_shares = int((equity * self.max_pos_pct) / entry_price)
-        
+
         # 3. 取兩者較小值
         return min(shares_by_risk, max_capital_shares)
     

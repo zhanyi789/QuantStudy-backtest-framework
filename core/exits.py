@@ -7,6 +7,9 @@ from abc import ABC, abstractmethod
 # ==========================================
 
 class ExitBase(ABC):
+    # P1-2: 宣告是否為盤中即時出場（子類別覆寫此屬性）
+    is_intraday: bool = False
+
     @abstractmethod
     def check(self, bar, position_data):
         pass
@@ -22,6 +25,8 @@ class RiskProvider(ABC):
 
 class FixedPercentStop(ExitBase, RiskProvider):
     """ 固定百分比停損 (硬停損) """
+    is_intraday = True  # P1-2: 盤中即時停損
+
     def __init__(self, pct=0.05):
         self.pct = pct  
 
@@ -44,8 +49,10 @@ class FixedPercentStop(ExitBase, RiskProvider):
             
         return False, None, None
 
-class ATRTrailingStop(ExitBase, RiskProvider): 
+class ATRTrailingStop(ExitBase, RiskProvider):
     """ 強健版 ATR 追蹤停損 """
+    is_intraday = True  # P1-2: 盤中即時追蹤停損
+
     def __init__(self, multiplier=3.0, period=14):
         self.multiplier = multiplier
         self.period = period

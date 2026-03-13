@@ -2,10 +2,18 @@
 # 1. 系統與交易成本 (System & Costs)
 # ==========================================
 system:
-  initial_capital: 1000000        
-  risk_free_rate: 0.02            
+  initial_capital: 1000000
+  risk_free_rate: 0.02
   commission_rate: 0.001425       # 交易手續費
   slippage_pct: 0.002             # 滑點設定
+
+# ==========================================
+# 1-B. 引擎層級參數 (Engine Core Parameters)
+# ==========================================
+engine:
+  max_positions: 10               # 最大同時持倉數 (0 = 無限制)
+  rank_metric: "crsi"             # 候選排序指標欄位名稱
+  ascending: true                 # 排序方向：true=升序(低值優先)
 
 # ==========================================
 # 2. 策略大腦庫 (Strategies) 

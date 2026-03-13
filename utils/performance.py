@@ -48,8 +48,10 @@ class PerformanceAnalyzer:
         daily_rf = self.rf / 252.0
         excess_ret = d['ret'] - daily_rf
         sharpe = (excess_ret.mean() / excess_ret.std()) * np.sqrt(252) if excess_ret.std() > 0 else 0
-        negative_ret = d['ret'][d['ret'] < 0]
-        downside_std = negative_ret.std() * np.sqrt(252)
+        # Sortino 分母：半變異數（Semi-deviation），用全部天數當分母，符合標準公式
+        # sqrt(mean(min(ret, 0)^2)) * sqrt(252)，而非只看負報酬天數的標準差
+        downside_sq = np.minimum(d['ret'], 0) ** 2
+        downside_std = np.sqrt(downside_sq.mean()) * np.sqrt(252)
         sortino = (cagr - self.rf) / downside_std if downside_std > 0 else 0
         calmar = cagr / abs(mdd) if mdd != 0 else 0
 
